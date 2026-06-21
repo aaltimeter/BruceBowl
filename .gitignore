@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+bruce_bowl.db
+.env
