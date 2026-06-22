@@ -3,18 +3,27 @@ from gpiozero import OutputDevice
 from time import sleep
 from datetime import datetime, date, timedelta
 import sqlite3
+import threading
 
 app = Flask(__name__)
 
 pump = OutputDevice(17, initial_value=False)
+pump_lock = threading.Lock()
 
 ML_PER_SECOND = 22.1
 ML_PER_OUNCE = 29.57
 DB_FILE = "bruce_bowl.db"
 
+LOCKOUT_MINUTES = 45
+LOCKOUT_SECONDS = LOCKOUT_MINUTES * 60
+
+
+def db_connect():
+    return sqlite3.connect(DB_FILE)
+
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = db_connect()
     cur = conn.cursor()
 
     cur.execute("""
@@ -26,6 +35,15 @@ def init_db():
         )
     """)
 
+    cur.execute("PRAGMA table_info(waterings)")
+    columns = [row[1] for row in cur.fetchall()]
+
+    if "action" not in columns:
+        cur.execute("ALTER TABLE waterings ADD COLUMN action TEXT DEFAULT 'dispense'")
+
+    if "note" not in columns:
+        cur.execute("ALTER TABLE waterings ADD COLUMN note TEXT DEFAULT ''")
+
     conn.commit()
     conn.close()
 
@@ -33,62 +51,135 @@ def init_db():
 def dispense_oz(oz):
     seconds = (oz * ML_PER_OUNCE) / ML_PER_SECOND
 
-    pump.on()
-    sleep(seconds)
-    pump.off()
+    with pump_lock:
+        pump.on()
+        sleep(seconds)
+        pump.off()
 
     return seconds
 
 
-def log_watering(oz, seconds):
-    conn = sqlite3.connect(DB_FILE)
+def log_event(oz, seconds, action="dispense", note=""):
+    conn = db_connect()
     cur = conn.cursor()
 
     cur.execute(
-        "INSERT INTO waterings (timestamp, ounces, seconds) VALUES (?, ?, ?)",
-        (datetime.now().isoformat(timespec="seconds"), oz, seconds)
+        """
+        INSERT INTO waterings (timestamp, ounces, seconds, action, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (datetime.now().isoformat(timespec="seconds"), oz, seconds, action, note)
     )
 
     conn.commit()
     conn.close()
 
 
+def get_last_successful_drink():
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT timestamp
+        FROM waterings
+        WHERE ounces > 0
+        AND action IN ('dispense', 'override')
+        ORDER BY id DESC
+        LIMIT 1
+    """)
+
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return datetime.fromisoformat(row[0])
+
+
+def get_lockout_status():
+    last_drink = get_last_successful_drink()
+
+    if last_drink is None:
+        return {
+            "locked": False,
+            "remaining_seconds": 0,
+            "remaining_text": "Ready",
+            "last_drink_text": "None yet"
+        }
+
+    now = datetime.now()
+    elapsed = (now - last_drink).total_seconds()
+    remaining = max(0, LOCKOUT_SECONDS - elapsed)
+
+    if remaining <= 0:
+        remaining_text = "Ready"
+        locked = False
+    else:
+        minutes = int(remaining // 60)
+        seconds = int(remaining % 60)
+        remaining_text = f"{minutes}m {seconds}s"
+        locked = True
+
+    return {
+        "locked": locked,
+        "remaining_seconds": int(remaining),
+        "remaining_text": remaining_text,
+        "last_drink_text": last_drink.strftime("%I:%M:%S %p")
+    }
+
+
 def get_stats():
-    conn = sqlite3.connect(DB_FILE)
+    conn = db_connect()
     cur = conn.cursor()
 
     today = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
-    cur.execute("SELECT COUNT(*), COALESCE(SUM(ounces), 0) FROM waterings")
+    cur.execute("""
+        SELECT COUNT(*), COALESCE(SUM(ounces), 0)
+        FROM waterings
+        WHERE ounces > 0
+    """)
     total_count, lifetime_oz = cur.fetchone()
 
-    cur.execute(
-        "SELECT COUNT(*), COALESCE(SUM(ounces), 0) FROM waterings WHERE DATE(timestamp)=?",
-        (today,)
-    )
+    cur.execute("""
+        SELECT COUNT(*), COALESCE(SUM(ounces), 0)
+        FROM waterings
+        WHERE DATE(timestamp)=?
+        AND ounces > 0
+    """, (today,))
     today_count, today_oz = cur.fetchone()
 
-    cur.execute(
-        "SELECT COUNT(*), COALESCE(SUM(ounces), 0) FROM waterings WHERE DATE(timestamp)=?",
-        (yesterday,)
-    )
+    cur.execute("""
+        SELECT COUNT(*), COALESCE(SUM(ounces), 0)
+        FROM waterings
+        WHERE DATE(timestamp)=?
+        AND ounces > 0
+    """, (yesterday,))
     yesterday_count, yesterday_oz = cur.fetchone()
 
-    cur.execute(
-        "SELECT timestamp, ounces, seconds FROM waterings WHERE DATE(timestamp)=? ORDER BY id DESC",
-        (today,)
-    )
+    cur.execute("""
+        SELECT timestamp, ounces, seconds, action, note
+        FROM waterings
+        WHERE DATE(timestamp)=?
+        ORDER BY id DESC
+    """, (today,))
     today_rows = cur.fetchall()
 
     conn.close()
 
     today_events = []
-    for ts, oz, seconds in today_rows:
+    for ts, oz, seconds, action, note in today_rows:
         dt = datetime.fromisoformat(ts)
-        today_events.append(
-            f"{dt.strftime('%I:%M:%S %p')} — Dispensed {oz:g} oz ({seconds:.2f} sec)"
-        )
+        time_text = dt.strftime("%I:%M:%S %p")
+
+        if action == "denied":
+            today_events.append(f"{time_text} — Denied: locked out")
+        elif action == "override":
+            today_events.append(f"{time_text} — OVERRIDE dispensed {oz:g} oz ({seconds:.2f} sec)")
+        else:
+            today_events.append(f"{time_text} — Dispensed {oz:g} oz ({seconds:.2f} sec)")
 
     return {
         "total_count": total_count,
@@ -161,6 +252,14 @@ h1 {
     margin-top: 8px;
 }
 
+.status-ready {
+    color: #3ee87a;
+}
+
+.status-locked {
+    color: #ff7676;
+}
+
 .buttons {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -186,6 +285,12 @@ button.big {
 
 button.warn {
     background: #c0392b;
+}
+
+button:disabled {
+    background: #4c5966;
+    color: #9aa6b2;
+    cursor: not-allowed;
 }
 
 .section {
@@ -218,8 +323,22 @@ button.warn {
     text-align: center;
 }
 
+.override-box {
+    margin-top: 24px;
+    background: #33210f;
+    border-radius: 18px;
+    padding: 18px;
+    text-align: center;
+}
+
 .reset-label {
     color: #ffb3b3;
+    font-size: 14px;
+    margin-bottom: 10px;
+}
+
+.override-label {
+    color: #ffd08a;
     font-size: 14px;
     margin-bottom: 10px;
 }
@@ -248,21 +367,44 @@ input[type=range] {
         </div>
 
         <div class="card">
-            <div class="label">Lifetime</div>
-            <div class="value">{{ lifetime_oz }} oz</div>
+            <div class="label">Last Drink</div>
+            <div class="value">{{ last_drink }}</div>
         </div>
 
         <div class="card">
-            <div class="label">Total Events</div>
-            <div class="value">{{ total_count }}</div>
+            <div class="label">Next Water</div>
+            {% if locked %}
+                <div class="value status-locked">{{ remaining_text }}</div>
+            {% else %}
+                <div class="value status-ready">Ready</div>
+            {% endif %}
         </div>
     </div>
 
     <form class="buttons" action="/dispense" method="post">
-        <button class="big" name="oz" value="4">Dispense 4 oz</button>
-        <button name="oz" value="6">6 oz</button>
-        <button class="warn" name="oz" value="8">8 oz</button>
+        <button class="big" name="oz" value="4" {% if locked %}disabled{% endif %}>
+            Dispense 4 oz
+        </button>
+
+        <button name="oz" value="6" {% if locked %}disabled{% endif %}>
+            6 oz
+        </button>
+
+        <button class="warn" name="oz" value="8" {% if locked %}disabled{% endif %}>
+            8 oz
+        </button>
     </form>
+
+    {% if locked %}
+    <div class="override-box">
+        <div class="override-label">
+            Emergency override: slide fully right to dispense 4 oz now
+        </div>
+        <form id="overrideForm" action="/override" method="post">
+            <input type="range" min="0" max="100" value="0" id="overrideSlider">
+        </form>
+    </div>
+    {% endif %}
 
     <div class="reset-box">
         <div class="reset-label">Slide fully right to reset today's drinks</div>
@@ -296,23 +438,54 @@ input[type=range] {
         </div>
     </div>
 
+    <div class="section">
+        <h2>Lifetime</h2>
+        <div class="grid">
+            <div class="card">
+                <div class="label">Events</div>
+                <div class="value">{{ total_count }}</div>
+            </div>
+            <div class="card">
+                <div class="label">Ounces</div>
+                <div class="value">{{ lifetime_oz }} oz</div>
+            </div>
+        </div>
+    </div>
+
 </div>
 
 <script>
-const slider = document.getElementById("resetSlider");
+const resetSlider = document.getElementById("resetSlider");
 const resetForm = document.getElementById("resetForm");
 
-slider.addEventListener("change", function() {
-    if (slider.value >= 95) {
+resetSlider.addEventListener("change", function() {
+    if (resetSlider.value >= 95) {
         if (confirm("Reset today's drink log? This cannot be undone.")) {
             resetForm.submit();
         } else {
-            slider.value = 0;
+            resetSlider.value = 0;
         }
     } else {
-        slider.value = 0;
+        resetSlider.value = 0;
     }
 });
+
+const overrideSlider = document.getElementById("overrideSlider");
+const overrideForm = document.getElementById("overrideForm");
+
+if (overrideSlider) {
+    overrideSlider.addEventListener("change", function() {
+        if (overrideSlider.value >= 95) {
+            if (confirm("Emergency override: dispense 4 oz now?")) {
+                overrideForm.submit();
+            } else {
+                overrideSlider.value = 0;
+            }
+        } else {
+            overrideSlider.value = 0;
+        }
+    });
+}
 </script>
 
 </body>
@@ -323,6 +496,7 @@ slider.addEventListener("change", function() {
 @app.route("/")
 def home():
     stats = get_stats()
+    lockout = get_lockout_status()
 
     return render_template_string(
         PAGE,
@@ -333,20 +507,39 @@ def home():
         yesterday_count=stats["yesterday_count"],
         yesterday_oz=round(stats["yesterday_oz"], 2),
         today_events=stats["today_events"],
+        locked=lockout["locked"],
+        remaining_text=lockout["remaining_text"],
+        last_drink=lockout["last_drink_text"],
     )
 
 
 @app.route("/dispense", methods=["POST"])
 def dispense():
+    lockout = get_lockout_status()
+
+    if lockout["locked"]:
+        log_event(0, 0, action="denied", note="Normal dispense denied during lockout")
+        return redirect("/")
+
     oz = float(request.form.get("oz", 4))
     seconds = dispense_oz(oz)
-    log_watering(oz, seconds)
+    log_event(oz, seconds, action="dispense", note="Normal dispense")
+
+    return redirect("/")
+
+
+@app.route("/override", methods=["POST"])
+def override():
+    oz = 4
+    seconds = dispense_oz(oz)
+    log_event(oz, seconds, action="override", note="Emergency override")
+
     return redirect("/")
 
 
 @app.route("/reset_today", methods=["POST"])
 def reset_today():
-    conn = sqlite3.connect(DB_FILE)
+    conn = db_connect()
     cur = conn.cursor()
 
     today = date.today().isoformat()
